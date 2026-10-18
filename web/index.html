@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>iPhone Audio Bridge</title>
+
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+            background: #111;
+            color: white;
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .container {
+            width: 90%;
+            max-width: 500px;
+            text-align: center;
+        }
+
+        button {
+            width: 100%;
+            padding: 18px;
+            margin-top: 12px;
+            border: 0;
+            border-radius: 14px;
+            background: #007aff;
+            color: white;
+            font-size: 18px;
+            font-weight: 600;
+        }
+
+        button.mic-on {
+            background: #ff453a;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+        }
+
+        #status {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 12px;
+            background: #222;
+            color: #aaa;
+            white-space: pre-line;
+        }
+
+        .ok {
+            color: #4cd964 !important;
+        }
+
+        .error {
+            color: #ff453a !important;
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="container">
+
+    <h1>🎧 Audio Bridge</h1>
+
+    <p>Connect your Bluetooth headphones to the iPhone first.</p>
+
+    <button id="connect" disabled>Connect</button>
+    <button id="mic" disabled>🎤 Start microphone</button>
+
+    <div id="status">Loading...</div>
+
+</div>
+
+<script>
+
+const button = document.getElementById("connect");
+const micButton = document.getElementById("mic");
+const status = document.getElementById("status");
+
+const BUFFER_SIZE = 1024;
+const MAX_QUEUE = 6;
+const KEEP_QUEUE = 3;
+
+let audioContext;
+let processor;
+let websocket;
+let audioElement;
+
+let streamRate = 48000;
+let streamChannels = 2;
+
+let micAvailable = false;
+let micRate = 48000;
+let micChannels = 2;
+
+let audioQueue = [];
+let currentBuffer = null;
+let currentPosition = 0;
+
+let micOn = false;
+let micStream;
+let micContext;
+let micSource;
+let micProcessor;
+let micSocket;
+
+
+function setStatus(text, className = "") {
+    status.textContent = text;
+    status.className = className;
+}
+
+
+fetch("/config")
+    .then((r) => r.json())
+    .then((cfg) => {
+        streamRate = cfg.sampleRate;
+        streamChannels = cfg.channels;
+        micAvailable = cfg.micAvailable;
+        micRate = cfg.micRate;
+        micChannels = cfg.micChannels;
+
+        button.disabled = false;
+        micButton.disabled = !micAvailable;
+
+        setStatus(
+            "Ready (" + streamRate + " Hz)" +
+            (micAvailable ? "" : "\nMicrophone unavailable: VB-Cable not found on the PC")
+        );
+    })
+    .catch((e) => {
+        setStatus("Could not load settings: " + e.message, "error");
+    });
+
+
+function resumeAudio() {
+    if (audioContext && audioContext.state !== "running") {
+        audioContext.resume().catch(() => {});
+    }
+    if (audioElement && audioElement.paused) {
+        audioElement.play().catch(() => {});
+    }
+}
+
+document.addEventListener("visibilitychange", resumeAudio);
+
+
+/* ---------- PC audio -> iPhone ---------- */
+
+button.addEventListener("click", async () => {
+
+    button.disabled = true;
+
+    try {
+
+        setStatus("Starting audio...");
+
+        audioContext = new (window.AudioContext || window.webkitAudioContext)({
+            sampleRate: streamRate,
+            latencyHint: "interactive"
+        });
+
+        await audioContext.resume();
+
+        audioContext.onstatechange = resumeAudio;
+
+        processor = audioContext.createScriptProcessor(BUFFER_SIZE, 0, 2);
+
+        processor.onaudioprocess = function (event) {
+
+            const output = event.outputBuffer;
+            const left = output.getChannelData(0);
+            const right = output.getChannelData(1);
+
+            const ch = streamChannels;
+
+            for (let i = 0; i < output.length; i++) {
+
+                if (
+                    !currentBuffer ||
+                    currentPosition >= currentBuffer.length / ch
+                ) {
+                    if (audioQueue.length > 0) {
+                        currentBuffer = audioQueue.shift();
+                        currentPosition = 0;
+                    } else {
+                        left[i] = 0;
+                        right[i] = 0;
+                        continue;
+                    }
+                }
+
+                const index = currentPosition * ch;
+
+                left[i] = currentBuffer[index] / 32768;
+                right[i] = ch > 1
+                    ? currentBuffer[index + 1] / 32768
+                    : left[i];
+
+                currentPosition++;
+            }
+        };
+
+        const dest = audioContext.createMediaStreamDestination();
+        processor.connect(dest);
+
+        audioElement = new Audio();
+        audioElement.srcObject = dest.stream;
+        audioElement.setAttribute("playsinline", "");
+        await audioElement.play();
+
+        if ("mediaSession" in navigator) {
+            navigator.mediaSession.metadata = new MediaMetadata({
+                title: "PC audio",
+                artist: "Audio Bridge"
+            });
+            navigator.mediaSession.playbackState = "playing";
+            navigator.mediaSession.setActionHandler("play", resumeAudio);
+        }
+
+        const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+        const url = protocol + "//" + location.host + "/audio";
+
+        setStatus("Connecting to the PC...");
+
+        websocket = new WebSocket(url);
+        websocket.binaryType = "arraybuffer";
+
+        websocket.onopen = () => {
+            setStatus("✓ Connected. Receiving audio...", "ok");
+        };
+
+        websocket.onmessage = (event) => {
+
+            audioQueue.push(new Int16Array(event.data));
+
+            if (audioQueue.length > MAX_QUEUE) {
+                audioQueue.splice(0, audioQueue.length - KEEP_QUEUE);
+            }
+        };
+
+        websocket.onerror = (error) => {
+            console.error(error);
+            setStatus("WebSocket error", "error");
+        };
+
+        websocket.onclose = () => {
+            setStatus("Connection closed", "error");
+            button.disabled = false;
+        };
+
+    } catch (error) {
+
+        console.error(error);
+        setStatus("Error: " + error.message, "error");
+        button.disabled = false;
+    }
+
+});
+
+
+/* ---------- iPhone (AirPods) microphone -> PC ---------- */
+
+async function startMic() {
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error(
+            "The microphone requires HTTPS. Open the page via https://"
+        );
+    }
+
+    micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false
+        }
+    });
+
+    micContext = new (window.AudioContext || window.webkitAudioContext)({
+        sampleRate: micRate
+    });
+
+    await micContext.resume();
+
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+
+    micSocket = new WebSocket(protocol + "//" + location.host + "/mic");
+    micSocket.binaryType = "arraybuffer";
+
+    await new Promise((resolve, reject) => {
+        micSocket.onopen = resolve;
+        micSocket.onerror = () => reject(new Error("Microphone WebSocket error"));
+    });
+
+    micSocket.onclose = () => {
+        if (micOn) stopMic();
+    };
+
+    micSource = micContext.createMediaStreamSource(micStream);
+    micProcessor = micContext.createScriptProcessor(1024, 1, 1);
+
+    micProcessor.onaudioprocess = (event) => {
+
+        const input = event.inputBuffer.getChannelData(0);
+        const out = new Int16Array(input.length * micChannels);
+
+        for (let i = 0; i < input.length; i++) {
+
+            const s = Math.max(-1, Math.min(1, input[i]));
+            const v = s < 0 ? s * 32768 : s * 32767;
+
+            for (let c = 0; c < micChannels; c++) {
+                out[i * micChannels + c] = v;
+            }
+        }
+
+        if (micSocket.readyState === 1 && micSocket.bufferedAmount < 20000) {
+            micSocket.send(out.buffer);
+        }
+    };
+
+    micSource.connect(micProcessor);
+    micProcessor.connect(micContext.destination);
+}
+
+
+function stopMic() {
+
+    micOn = false;
+
+    if (micProcessor) micProcessor.disconnect();
+    if (micSource) micSource.disconnect();
+    if (micStream) micStream.getTracks().forEach((t) => t.stop());
+    if (micContext) micContext.close();
+    if (micSocket) micSocket.close();
+
+    micProcessor = micSource = micStream = micContext = micSocket = null;
+
+    micButton.textContent = "🎤 Start microphone";
+    micButton.classList.remove("mic-on");
+}
+
+
+micButton.addEventListener("click", async () => {
+
+    if (micOn) {
+        stopMic();
+        setStatus("Microphone stopped");
+        return;
+    }
+
+    micButton.disabled = true;
+
+    try {
+
+        await startMic();
+
+        micOn = true;
+
+        micButton.textContent = "🎤 Stop microphone";
+        micButton.classList.add("mic-on");
+
+        setStatus("✓ Microphone is on", "ok");
+
+    } catch (error) {
+
+        console.error(error);
+        stopMic();
+        setStatus("Microphone error: " + error.message, "error");
+    }
+
+    micButton.disabled = false;
+});
+
+</script>
+
+</body>
+</html>

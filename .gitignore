@@ -1,0 +1,15 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Self-signed TLS certificate generated on first run (NEVER commit the private key)
+cert.pem
+key.pem
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
